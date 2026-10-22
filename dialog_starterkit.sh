@@ -98,16 +98,12 @@ set -euo pipefail
   ENABLE_LOGFILE="true"
   LOGDIR="${MANAGEMENT_DIR}/Logs"
 
-# Parameter 4: Testing Mode [ false (default) | true ]
-  TESTING_MODE="${4:-false}"
-  case "${TESTING_MODE}" in
-    "true"|"True"|"TRUE")
-      TESTING_MODE="true"
-      ;;
-    *)
-      TESTING_MODE="false"
-      ;;
-  esac
+# Testing Mode: pass -test as any argument (e.g. sudo ./dialog_starterkit.sh -test,
+# or set a Jamf parameter to -test)
+  TESTING_MODE="false"
+  if (( ${@[(Ie)-test]} )); then
+    TESTING_MODE="true"
+  fi
 
 # Parameter 5: Preset name [ empty (default, user chooses) | a PresetName from PRESETS ]
 # Skips the preset picker so a Self Service policy can be scoped to one persona.

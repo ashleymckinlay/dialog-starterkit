@@ -97,9 +97,9 @@ Icons are cached under `${MANAGEMENT_DIR}/Branding/Icons/`. Host PNGs at `${ICON
 
 The macOS 15+ requirement covers both SwiftDialog 3 and system `jq`.
 
-### Jamf Parameter 4
+### Testing Mode
 
-Optional **Testing Mode**. When `true`, Jamf install triggers and destructive file operations are logged and skipped. A missing Jamf binary is only a warning, so the script can be tried on a Mac that is not enrolled.
+Pass `-test` as any argument to enable **Testing Mode**, either locally (`sudo ./dialog_starterkit.sh -test`) or by setting a Jamf parameter (such as Parameter 4) to `-test`. In Testing Mode, Jamf install triggers and destructive file operations are logged and skipped. A missing Jamf binary is only a warning, so the script can be tried on a Mac that is not enrolled.
 
 ### Jamf Parameter 5
 
