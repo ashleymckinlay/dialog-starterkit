@@ -4,7 +4,7 @@ Starter Kits give end users a simple way to select and install a group of apps r
 
 For MacAdmins, Starter Kits keep enrolment lean and generic. Instead of maintaining many enrolment workflows, users pick the apps they need from Self Service.
 
-**Version:** 2.0.0 (17/08/2026)  
+**Version:** 2.1.0 (22/10/2026)  
 **Requires:** macOS 15+ (includes system `jq`), SwiftDialog 3.1.0+, Jamf
 
 This release modernises the starter kit to zsh, checkbox selection, and SwiftDialog Inspect Mode for install progress.
@@ -15,10 +15,12 @@ This release modernises the starter kit to zsh, checkbox selection, and SwiftDia
 2. Ensure SwiftDialog 3.1.0+ is installed (Jamf trigger when missing), then verify the dialog icon path.
 3. Exit without prompting when a Zoom or Teams meeting appears active.
 4. Validate the app catalogue and cache branding icons where possible.
-5. Present a timed checkbox selection dialog with Install, Cancel, and Support.
-6. Launch SwiftDialog Inspect Mode (preset 1) for the selected apps only.
-7. Install each selected app with `jamf policy -event`, retrying up to three times and verifying the app path.
-8. On success, auto-close the progress window after 60 seconds (Done remains available sooner). On failure, show a summary dialog.
+5. Look on the user's Desktop for installers listed in `DESKTOP_INSTALLER_HINTS` (Microsoft Office by default).
+6. Ask the user to pick a preset (persona), unless Parameter 5 names one.
+7. Present a timed checkbox selection dialog with the preset's apps, plus any app whose installer was found on the Desktop, already ticked.
+8. Launch SwiftDialog Inspect Mode (preset 1) for the selected apps only.
+9. Install each selected app with `jamf policy -event`, retrying up to three times and verifying the app path.
+10. On success, auto-close the progress window after 60 seconds (Done remains available sooner). On failure, show a summary dialog.
 
 # Configuration
 
@@ -50,6 +52,38 @@ APPS=(
 )
 ```
 
+### Presets
+
+The `PRESETS` array defines the bundles / personas offered before the app list. Each entry is:
+
+`PresetName;Description;AppName,AppName`
+
+- **PresetName** — label shown in the preset picker (and the value for Parameter 5)
+- **Description** — one line shown under the picker
+- **AppName,AppName** — FriendlyNames from `APPS` to tick. Use `*` for every app, or leave it empty to start with nothing ticked
+
+```bash
+PRESETS=(
+  "Developer;Source control, terminal and archive tools;GitHub Desktop,iTerm,Keka"
+  "Everything;Every app in the Starter Kit;*"
+  "Custom;Start with nothing ticked and choose your own;"
+)
+```
+
+Users can still tick or untick individual apps after choosing a preset. Leave `PRESETS` empty to skip the picker and tick every app (the 2.0.0 behaviour). Presets that name an app missing from `APPS` stop the script before any dialog is shown.
+
+### Desktop installer detection
+
+`DESKTOP_INSTALLER_HINTS` ticks an app automatically when a matching installer is on the console user's Desktop, whichever preset is chosen. Each entry is `AppName;Pattern,Pattern`, with case-insensitive shell globs matched against the top level of `~/Desktop`:
+
+```bash
+DESKTOP_INSTALLER_HINTS=(
+  "Microsoft Office;*office*.pkg,*office*.mpkg,*office*.dmg,*microsoft*365*.pkg,*microsoft*365*.dmg"
+)
+```
+
+The Jamf agent needs Full Disk Access (via a PPPC profile) to read another user's Desktop. Without it nothing is found and the run continues normally.
+
 ### Icons
 
 Icons are cached under `${MANAGEMENT_DIR}/Branding/Icons/`. Host PNGs at `${ICON_BASE_URL}/${trigger}.png`. Missing or non-image downloads are discarded (object stores often return XML error bodies with HTTP 200). Apps without a usable icon still appear; the icon key is omitted so SwiftDialog does not exit 202.
@@ -66,6 +100,10 @@ The macOS 15+ requirement covers both SwiftDialog 3 and system `jq`.
 ### Jamf Parameter 4
 
 Optional **Testing Mode**. When `true`, Jamf install triggers and destructive file operations are logged and skipped.
+
+### Jamf Parameter 5
+
+Optional **Preset name**. When it matches a `PresetName`, the preset picker is skipped, so you can publish one Self Service policy per persona. An unknown name is logged and the picker is shown instead.
 
 # Notes
 
@@ -85,6 +123,11 @@ Optional **Testing Mode**. When `true`, Jamf install triggers and destructive fi
 <img width="932" alt="App install" src="Screenshots/App_install.png">
 
 # Version History
+
+### 2.1.0 (22/10/2026)
+- Preset (bundle / persona) picker before the app list, with Parameter 5 to preselect one
+- Apps whose installer is on the user's Desktop are ticked automatically (Microsoft Office by default)
+- Added Microsoft Office to the sample catalogue
 
 ### 2.0.0 (17/08/2026)
 - Modernised to zsh with SwiftDialog 3 Inspect Mode, icon validation, meeting deferral, install retries, Support button, and 60s auto-close
