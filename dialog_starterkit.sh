@@ -9,7 +9,7 @@ set -euo pipefail
 # Assisted by: Cursor
 #
 # Name:     dialog_starterkit.sh
-# Version:  2.0.0 (17/08/2026)
+# Version:  2.1.0 (22/10/2026)
 # Repo:     https://github.com/ooftee/dialog-starterkit
 #
 # This script was inspired by Adam Codega's:
@@ -22,9 +22,11 @@ set -euo pipefail
 # General Information
 ##########################################################################################
 #
-# Dialog Starter Kit. Presents a checkbox selection dialog, then installs chosen
-# apps via Jamf custom triggers while SwiftDialog Inspect Mode monitors install
-# paths and shows live progress.
+# Dialog Starter Kit. Asks the user to pick a preset (persona), presents a checkbox
+# selection dialog with that preset's apps ticked, then installs chosen apps via
+# Jamf custom triggers while SwiftDialog Inspect Mode monitors install paths and
+# shows live progress. Apps whose installer is sitting on the user's Desktop are
+# ticked automatically.
 #
 # Requires macOS 15 or newer and SwiftDialog 3.1.0 or newer.
 
@@ -53,6 +55,25 @@ set -euo pipefail
     "iMazing Profile Editor,/Applications/iMazing Profile Editor.app,install_imazingprofileeditor"
     "iTerm,/Applications/iTerm.app,install_iterm"
     "Keka,/Applications/Keka.app,install_keka"
+    "Microsoft Office,/Applications/Microsoft Word.app,install_microsoftoffice"
+  )
+
+# Presets (bundles / personas) format is PresetName;Description;AppName,AppName
+# App names must match a FriendlyName in APPS. Use * to tick every app, or leave
+# the app list empty for a preset that starts with nothing ticked. Leave PRESETS
+# empty to skip the preset picker and tick every app.
+  PRESETS=(
+    "Developer;Source control, terminal and archive tools;GitHub Desktop,iTerm,Keka"
+    "Mac Admin;Profile, packaging and icon tools for Mac admins;GitHub Desktop,Icons,iMazing Profile Editor,iTerm"
+    "Office Worker;Microsoft Office and everyday utilities;Microsoft Office,Keka"
+    "Everything;Every app in the Starter Kit;*"
+    "Custom;Start with nothing ticked and choose your own;"
+  )
+
+# Installers on the user's Desktop that tick an app automatically, on top of the preset
+# Format is AppName;Pattern,Pattern (shell globs, matched case-insensitively)
+  DESKTOP_INSTALLER_HINTS=(
+    "Microsoft Office;*office*.pkg,*office*.mpkg,*office*.dmg,*microsoft*365*.pkg,*microsoft*365*.dmg"
   )
 
 ##########################################################################################
@@ -77,16 +98,16 @@ set -euo pipefail
   ENABLE_LOGFILE="true"
   LOGDIR="${MANAGEMENT_DIR}/Logs"
 
-# Parameter 4: Testing Mode [ false (default) | true ]
-  TESTING_MODE="${4:-false}"
-  case "${TESTING_MODE}" in
-    "true"|"True"|"TRUE")
-      TESTING_MODE="true"
-      ;;
-    *)
-      TESTING_MODE="false"
-      ;;
-  esac
+# Testing Mode: pass -test as any argument (e.g. sudo ./dialog_starterkit.sh -test,
+# or set a Jamf parameter to -test)
+  TESTING_MODE="false"
+  if (( ${@[(Ie)-test]} )); then
+    TESTING_MODE="true"
+  fi
+
+# Parameter 5: Preset name [ empty (default, user chooses) | a PresetName from PRESETS ]
+# Skips the preset picker so a Self Service policy can be scoped to one persona.
+  PRESET_PARAMETER="${5:-}"
 
 ##########################################################################################
 # Global Functions
@@ -215,9 +236,15 @@ set -euo pipefail
   INSPECT_JSON_FILE=""
   INSPECT_COMMAND_FILE=""
   INSPECT_SESSIONS_DIR=""
+  TESTING_MARKERS_DIR=""
   INSPECT_PID=""
   SELECTED_APPS=()
   FAILED_APPS=()
+  PRESET_JSON_FILE=""
+  PRESET_SELECT_TITLE="Starter Kit"
+  SELECTED_PRESET=""
+  PRESET_APPS=()
+  DETECTED_APPS=()
 
 ##########################################################################################
 # Script Functions
@@ -235,9 +262,16 @@ set -euo pipefail
   }
 
 # Function: require_jamf_binary
-# Description: Fatal guard for the Jamf binary.
+# Description: Fatal guard for the Jamf binary. Testing Mode only warns, since it
+#              never runs Jamf, so the script can be tried on an unmanaged Mac.
   require_jamf_binary() {
-    [[ -x "${JAMF_BINARY}" ]] || fatal "Jamf binary not found at ${JAMF_BINARY}"
+    if [[ ! -x "${JAMF_BINARY}" ]]; then
+      if [[ "${TESTING_MODE}" == "true" ]]; then
+        warn "[TESTING MODE] Jamf binary not found at ${JAMF_BINARY}; continuing"
+        return 0
+      fi
+      fatal "Jamf binary not found at ${JAMF_BINARY}"
+    fi
     info "Jamf binary is available"
   }
 
@@ -301,14 +335,16 @@ set -euo pipefail
   ensure_temp_workspace() {
     TEMP_DIR=$(mktemp -d "/private/tmp/dialog_starterkit.XXXXXX") || fatal "Unable to create temporary directory"
     SELECTION_JSON_FILE="${TEMP_DIR}/selection.json"
+    PRESET_JSON_FILE="${TEMP_DIR}/preset.json"
     INSPECT_JSON_FILE="${TEMP_DIR}/inspect.json"
     INSPECT_COMMAND_FILE="${TEMP_DIR}/inspect.command"
     INSPECT_SESSIONS_DIR="${TEMP_DIR}/sessions"
+    TESTING_MARKERS_DIR="${TEMP_DIR}/testing"
 
-    mkdir -p "${INSPECT_SESSIONS_DIR}" || fatal "Unable to create Inspect Mode sessions directory"
+    mkdir -p "${INSPECT_SESSIONS_DIR}" "${TESTING_MARKERS_DIR}" || fatal "Unable to create Inspect Mode sessions directory"
     : > "${INSPECT_COMMAND_FILE}"
 
-    chmod 755 "${TEMP_DIR}" "${INSPECT_SESSIONS_DIR}" || fatal "Unable to set temporary workspace permissions"
+    chmod 755 "${TEMP_DIR}" "${INSPECT_SESSIONS_DIR}" "${TESTING_MARKERS_DIR}" || fatal "Unable to set temporary workspace permissions"
     chmod 644 "${INSPECT_COMMAND_FILE}" || fatal "Unable to set command file permissions"
 
     info "Created temporary workspace: ${TEMP_DIR}"
@@ -501,13 +537,226 @@ set -euo pipefail
     return 0
   }
 
+# --- Presets ---
+
+# Function: validate_presets
+# Description: Validate each PresetName;Description;Apps record and confirm every
+#              app it names exists in the catalogue.
+  validate_presets() {
+    local preset_entry preset_name preset_description preset_apps app_name
+
+    if (( ${#PRESETS[@]} == 0 )); then
+      info "No presets configured; every app will be ticked"
+      return 0
+    fi
+
+    for preset_entry in "${PRESETS[@]}"; do
+      IFS=';' read -r preset_name preset_description preset_apps <<< "${preset_entry}"
+      [[ -n "${preset_name}" ]] || fatal "Preset entry is missing a name: ${preset_entry}"
+      [[ "${preset_apps}" == "*" ]] && continue
+      for app_name in "${(@s:,:)preset_apps}"; do
+        [[ -n "${app_name}" ]] || continue
+        find_app_entry_by_name "${app_name}" >/dev/null \
+          || fatal "Preset ${preset_name} names an app that is not in the catalogue: ${app_name}"
+      done
+    done
+
+    info "Validated ${#PRESETS[@]} presets"
+  }
+
+# Function: find_preset_entry_by_name
+# Description: Return the PRESETS record matching a preset name.
+# Usage: entry=$(find_preset_entry_by_name "Developer")
+# Returns: Prints the record on success; returns 1 when not found
+  find_preset_entry_by_name() {
+    local wanted_name="${1:-}"
+    local preset_entry
+
+    [[ -n "${wanted_name}" ]] || return 1
+
+    for preset_entry in "${PRESETS[@]}"; do
+      if [[ "${preset_entry%%;*}" == "${wanted_name}" ]]; then
+        printf '%s\n' "${preset_entry}"
+        return 0
+      fi
+    done
+    return 1
+  }
+
+# Function: apply_preset
+# Description: Record the chosen preset and the app names it ticks in PRESET_APPS.
+# Usage: apply_preset "Developer"
+  apply_preset() {
+    local preset_entry preset_name preset_description preset_apps
+
+    preset_entry=$(find_preset_entry_by_name "${1:-}") || return 1
+    IFS=';' read -r preset_name preset_description preset_apps <<< "${preset_entry}"
+
+    SELECTED_PRESET="${preset_name}"
+    PRESET_APPS=("${(@s:,:)preset_apps}")
+    info "Using preset ${SELECTED_PRESET} (${preset_apps:-no apps ticked})"
+  }
+
+# Function: build_preset_json
+# Description: Write the preset picker dialog JSON, listing each preset's description.
+  build_preset_json() {
+    local preset_entry preset_name preset_description preset_apps
+    local preset_names=()
+    local preset_lines=""
+
+    for preset_entry in "${PRESETS[@]}"; do
+      IFS=';' read -r preset_name preset_description preset_apps <<< "${preset_entry}"
+      preset_names+=("${preset_name}")
+      preset_lines+="- **${preset_name}**${preset_description:+ — ${preset_description}}\n"
+    done
+
+    jq -n \
+      --arg title "Starter Kit" \
+      --arg subtitle "Choose a starter kit" \
+      --arg message "Pick the kit that best matches your role. You can add or remove individual apps on the next screen.\n\n${preset_lines}" \
+      --arg icon "${ICON}" \
+      --arg support_url "${SUPPORT_URL}" \
+      --arg select_title "${PRESET_SELECT_TITLE}" \
+      --argjson values "$(printf '%s\n' "${preset_names[@]}" | jq -R . | jq -s .)" \
+      '{
+        title: $title,
+        subtitle: $subtitle,
+        message: $message,
+        messagefont: "size=14",
+        icon: $icon,
+        iconalttext: "Starter Kit",
+        button1text: "Next",
+        button1symbol: "arrow.right.circle.fill,leading",
+        button2text: "Cancel",
+        infobuttontext: "Support",
+        infobuttonaction: $support_url,
+        selectitems: [{title: $select_title, values: $values, default: $values[0], style: "radio"}]
+      }' > "${PRESET_JSON_FILE}" || fatal "Unable to write preset JSON"
+
+    chmod 644 "${PRESET_JSON_FILE}" || fatal "Unable to set preset JSON permissions"
+
+    info "Wrote preset dialog JSON: ${PRESET_JSON_FILE}"
+  }
+
+# Function: choose_preset
+# Description: Set the preset from Parameter 5, or ask the user to pick one.
+#              With no presets configured, every app is ticked as before.
+# Returns: 0 when a preset is applied, 1 when the user declines
+  choose_preset() {
+    local returncode=0
+    local preset_json="" preset_name=""
+
+    if (( ${#PRESETS[@]} == 0 )); then
+      PRESET_APPS=("*")
+      return 0
+    fi
+
+    if [[ -n "${PRESET_PARAMETER}" ]]; then
+      if apply_preset "${PRESET_PARAMETER}"; then
+        info "Preset ${PRESET_PARAMETER} set by Parameter 5; skipping the preset picker"
+        return 0
+      fi
+      warn "Parameter 5 preset not found: ${PRESET_PARAMETER}. Asking the user instead."
+    fi
+
+    build_preset_json
+
+    info "Launching preset dialog for ${CURRENT_USER}"
+    preset_json=$(
+      "${DIALOG_BINARY}" \
+        --jsonfile "${PRESET_JSON_FILE}" \
+        --json \
+        --height "${SELECTION_DIALOG_HEIGHT}" \
+        --timer 300 \
+        --hidetimerbar
+    ) || returncode=$?
+
+    case "${returncode}" in
+      0) info "${CURRENT_USER} clicked Next" ;;
+      2) info "${CURRENT_USER} clicked Cancel on the preset dialog"; return 1 ;;
+      3) info "${CURRENT_USER} clicked Support on the preset dialog"; return 1 ;;
+      4|20) info "${CURRENT_USER} allowed the preset dialog timer to expire"; return 1 ;;
+      5) info "Preset dialog was closed by a quit command"; return 1 ;;
+      10) info "${CURRENT_USER} quit the preset dialog with Command-Q"; return 1 ;;
+      201|202)
+        error "SwiftDialog could not load an icon or file resource referenced by ${PRESET_JSON_FILE} (code ${returncode})"
+        log_unusable_resources "${PRESET_JSON_FILE}"
+        return 1
+        ;;
+      *) warn "Unexpected SwiftDialog return code from preset dialog: ${returncode}"; return 1 ;;
+    esac
+
+    preset_name=$(printf '%s' "${preset_json}" \
+      | jq -r --arg t "${PRESET_SELECT_TITLE}" '.[$t].selectedValue? // .SelectedOption? // empty' 2>/dev/null) || true
+
+    if ! apply_preset "${preset_name}"; then
+      warn "Preset dialog returned an unknown preset: ${preset_name:-empty}"
+      return 1
+    fi
+    return 0
+  }
+
+# --- Desktop installer detection ---
+
+# Function: detect_desktop_installers
+# Description: Look on the console user's Desktop for installers listed in
+#              DESKTOP_INSTALLER_HINTS and record matching app names in DETECTED_APPS.
+#              Reading another user's Desktop as root needs Full Disk Access for the
+#              Jamf agent; without it nothing is found and the run continues.
+  detect_desktop_installers() {
+    local desktop_dir="/Users/${CURRENT_USER}/Desktop"
+    local hint_entry app_name hint_patterns pattern match
+
+    DETECTED_APPS=()
+    (( ${#DESKTOP_INSTALLER_HINTS[@]} > 0 )) || return 0
+
+    if [[ ! -d "${desktop_dir}" ]]; then
+      warn "Desktop not found for ${CURRENT_USER}: ${desktop_dir}"
+      return 0
+    fi
+
+    for hint_entry in "${DESKTOP_INSTALLER_HINTS[@]}"; do
+      IFS=';' read -r app_name hint_patterns <<< "${hint_entry}"
+      if ! find_app_entry_by_name "${app_name}" >/dev/null; then
+        warn "Desktop installer hint names an app that is not in the catalogue: ${app_name}"
+        continue
+      fi
+      for pattern in "${(@s:,:)hint_patterns}"; do
+        [[ -n "${pattern}" ]] || continue
+        match=$(find "${desktop_dir}" -maxdepth 1 -iname "${pattern}" -print -quit 2>/dev/null) || true
+        if [[ -n "${match}" ]]; then
+          info "Found ${app_name} installer on the Desktop: ${match}"
+          DETECTED_APPS+=("${app_name}")
+          break
+        fi
+      done
+    done
+  }
+
+# Function: is_app_preticked
+# Description: Check whether an app is ticked by the preset or a Desktop installer.
+# Usage: if is_app_preticked "iTerm"; then ...
+  is_app_preticked() {
+    local app_name="${1:-}"
+    (( ${PRESET_APPS[(Ie)*]} || ${PRESET_APPS[(Ie)${app_name}]} || ${DETECTED_APPS[(Ie)${app_name}]} ))
+  }
+
 # --- Selection dialog ---
 
 # Function: build_selection_json
 # Description: Write the checkbox selection dialog JSON for the full catalogue.
   build_selection_json() {
-    local app_entry app_name app_location app_trigger app_icon
+    local app_entry app_name app_location app_trigger app_icon app_checked
     local checkbox_json
+    local subtitle="Choose the apps to install"
+    local message="Please select the apps you want to install.\n\nScroll down to see them all."
+
+    if [[ -n "${SELECTED_PRESET}" ]]; then
+      subtitle="${SELECTED_PRESET} kit: choose the apps to install"
+    fi
+    if (( ${#DETECTED_APPS[@]} > 0 )); then
+      message+="\n\nWe found an installer on your Desktop, so ${(j:, :)DETECTED_APPS} has been ticked for you."
+    fi
 
     checkbox_json=$(
       {
@@ -516,10 +765,13 @@ set -euo pipefail
           app_location=$(get_app_field "${app_entry}" 2)
           app_trigger=$(get_app_field "${app_entry}" 3)
           app_icon=$(get_icon_for_app "${app_trigger}" "${app_location}")
+          app_checked=false
+          is_app_preticked "${app_name}" && app_checked=true
           jq -n \
             --arg label "${app_name}" \
             --arg icon "${app_icon}" \
-            '{label: $label, checked: true}
+            --argjson checked "${app_checked}" \
+            '{label: $label, checked: $checked}
              + (if $icon == "" then {} else {icon: $icon} end)'
         done
       } | jq -s '.'
@@ -527,8 +779,8 @@ set -euo pipefail
 
     jq -n \
       --arg title "Starter Kit" \
-      --arg subtitle "Choose the apps to install" \
-      --arg message "Please select the apps you want to install.\n\nScroll down to see them all." \
+      --arg subtitle "${subtitle}" \
+      --arg message "${message}" \
       --arg icon "${ICON}" \
       --arg support_url "${SUPPORT_URL}" \
       --argjson checkbox "${checkbox_json}" \
@@ -648,6 +900,22 @@ set -euo pipefail
 
 # --- Inspect Mode progress ---
 
+# Function: get_inspect_path
+# Description: Return the path Inspect Mode watches to mark an app complete. Testing
+#              Mode never installs anything, so apps not yet installed are watched via
+#              a marker file that install_selected_apps creates in place of the install.
+# Usage: path=$(get_inspect_path "install_iterm" "/Applications/iTerm.app")
+  get_inspect_path() {
+    local app_trigger="${1:-}"
+    local app_location="${2:-}"
+
+    if [[ "${TESTING_MODE}" == "true" && ! -e "${app_location}" ]]; then
+      printf '%s\n' "${TESTING_MARKERS_DIR}/${app_trigger}"
+      return 0
+    fi
+    printf '%s\n' "${app_location}"
+  }
+
 # Function: build_inspect_json
 # Description: Write an Inspect Mode preset 1 config for the selected apps only.
 #              Note: preset 1 does not reliably display the top-level message, and
@@ -669,7 +937,7 @@ set -euo pipefail
             --arg id "${app_trigger}" \
             --arg displayName "${app_name}" \
             --argjson guiIndex "${gui_index}" \
-            --arg path "${app_location}" \
+            --arg path "$(get_inspect_path "${app_trigger}" "${app_location}")" \
             --arg icon "${app_icon}" \
             '{
               id: $id,
@@ -839,6 +1107,8 @@ set -euo pipefail
       while (( attempt <= MAX_INSTALL_RETRIES )); do
         if [[ "${TESTING_MODE}" == "true" ]]; then
           info "[TESTING MODE] Would run: ${JAMF_BINARY} policy -event ${app_trigger}"
+          sleep 2
+          touch "${TESTING_MARKERS_DIR}/${app_trigger}" || warn "Unable to create testing marker for ${app_name}"
           installed="true"
           break
         fi
@@ -908,7 +1178,14 @@ set -euo pipefail
   require_dialog_icon
   ensure_temp_workspace
   validate_app_catalogue
+  validate_presets
   cache_app_icons
+  detect_desktop_installers
+
+  if ! choose_preset; then
+    info "No preset chosen. No apps will be installed this run."
+    exit 0
+  fi
 
   if ! show_selection_dialog; then
     info "No apps will be installed this run."
