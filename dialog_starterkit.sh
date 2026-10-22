@@ -236,6 +236,7 @@ set -euo pipefail
   INSPECT_JSON_FILE=""
   INSPECT_COMMAND_FILE=""
   INSPECT_SESSIONS_DIR=""
+  TESTING_MARKERS_DIR=""
   INSPECT_PID=""
   SELECTED_APPS=()
   FAILED_APPS=()
@@ -338,11 +339,12 @@ set -euo pipefail
     INSPECT_JSON_FILE="${TEMP_DIR}/inspect.json"
     INSPECT_COMMAND_FILE="${TEMP_DIR}/inspect.command"
     INSPECT_SESSIONS_DIR="${TEMP_DIR}/sessions"
+    TESTING_MARKERS_DIR="${TEMP_DIR}/testing"
 
-    mkdir -p "${INSPECT_SESSIONS_DIR}" || fatal "Unable to create Inspect Mode sessions directory"
+    mkdir -p "${INSPECT_SESSIONS_DIR}" "${TESTING_MARKERS_DIR}" || fatal "Unable to create Inspect Mode sessions directory"
     : > "${INSPECT_COMMAND_FILE}"
 
-    chmod 755 "${TEMP_DIR}" "${INSPECT_SESSIONS_DIR}" || fatal "Unable to set temporary workspace permissions"
+    chmod 755 "${TEMP_DIR}" "${INSPECT_SESSIONS_DIR}" "${TESTING_MARKERS_DIR}" || fatal "Unable to set temporary workspace permissions"
     chmod 644 "${INSPECT_COMMAND_FILE}" || fatal "Unable to set command file permissions"
 
     info "Created temporary workspace: ${TEMP_DIR}"
@@ -898,6 +900,22 @@ set -euo pipefail
 
 # --- Inspect Mode progress ---
 
+# Function: get_inspect_path
+# Description: Return the path Inspect Mode watches to mark an app complete. Testing
+#              Mode never installs anything, so apps not yet installed are watched via
+#              a marker file that install_selected_apps creates in place of the install.
+# Usage: path=$(get_inspect_path "install_iterm" "/Applications/iTerm.app")
+  get_inspect_path() {
+    local app_trigger="${1:-}"
+    local app_location="${2:-}"
+
+    if [[ "${TESTING_MODE}" == "true" && ! -e "${app_location}" ]]; then
+      printf '%s\n' "${TESTING_MARKERS_DIR}/${app_trigger}"
+      return 0
+    fi
+    printf '%s\n' "${app_location}"
+  }
+
 # Function: build_inspect_json
 # Description: Write an Inspect Mode preset 1 config for the selected apps only.
 #              Note: preset 1 does not reliably display the top-level message, and
@@ -919,7 +937,7 @@ set -euo pipefail
             --arg id "${app_trigger}" \
             --arg displayName "${app_name}" \
             --argjson guiIndex "${gui_index}" \
-            --arg path "${app_location}" \
+            --arg path "$(get_inspect_path "${app_trigger}" "${app_location}")" \
             --arg icon "${app_icon}" \
             '{
               id: $id,
@@ -1089,6 +1107,8 @@ set -euo pipefail
       while (( attempt <= MAX_INSTALL_RETRIES )); do
         if [[ "${TESTING_MODE}" == "true" ]]; then
           info "[TESTING MODE] Would run: ${JAMF_BINARY} policy -event ${app_trigger}"
+          sleep 2
+          touch "${TESTING_MARKERS_DIR}/${app_trigger}" || warn "Unable to create testing marker for ${app_name}"
           installed="true"
           break
         fi
