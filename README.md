@@ -99,7 +99,7 @@ The macOS 15+ requirement covers both SwiftDialog 3 and system `jq`.
 
 ### Jamf Parameter 4
 
-Optional **Testing Mode**. When `true`, Jamf install triggers and destructive file operations are logged and skipped.
+Optional **Testing Mode**. When `true`, Jamf install triggers and destructive file operations are logged and skipped. A missing Jamf binary is only a warning, so the script can be tried on a Mac that is not enrolled.
 
 ### Jamf Parameter 5
 

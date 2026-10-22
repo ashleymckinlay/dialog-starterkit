@@ -265,9 +265,16 @@ set -euo pipefail
   }
 
 # Function: require_jamf_binary
-# Description: Fatal guard for the Jamf binary.
+# Description: Fatal guard for the Jamf binary. Testing Mode only warns, since it
+#              never runs Jamf, so the script can be tried on an unmanaged Mac.
   require_jamf_binary() {
-    [[ -x "${JAMF_BINARY}" ]] || fatal "Jamf binary not found at ${JAMF_BINARY}"
+    if [[ ! -x "${JAMF_BINARY}" ]]; then
+      if [[ "${TESTING_MODE}" == "true" ]]; then
+        warn "[TESTING MODE] Jamf binary not found at ${JAMF_BINARY}; continuing"
+        return 0
+      fi
+      fatal "Jamf binary not found at ${JAMF_BINARY}"
+    fi
     info "Jamf binary is available"
   }
 
